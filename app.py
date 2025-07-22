@@ -1,110 +1,133 @@
 from flask import Flask, request, jsonify
-from flask_socketio import SocketIO, emit
-import json
-import os
+from flask_socketio import SocketIO
+import json, os, datetime
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'secret!'
-socketio = SocketIO(app, cors_allowed_origins="*")  # Permet à Flutter de se connecter
+app.config["SECRET_KEY"] = "secret!"
+socketio = SocketIO(app, cors_allowed_origins="*")
 
-# Fichiers JSON
-MATCHS_FILE = "matchs.json"
-PARIS_FILE = "paris.json"
-RESULTATS_FILE = "resultats.json"
+# ---------- fichiers persistants ----------
+DATA = {
+    "MATCHS":  "matchs.json",
+    "PARIS":   "paris.json",
+    "RESULTS": "resultats.json",
+    "USERS":   "users.json"          # ➜ nom, âge, soldes
+}
+for f in DATA.values():
+    if not os.path.exists(f):
+        with open(f, "w") as fp:
+            json.dump([], fp)
 
-# Créer les fichiers s'ils n'existent pas
-for file in [MATCHS_FILE, PARIS_FILE, RESULTATS_FILE]:
-    if not os.path.exists(file):
-        with open(file, 'w') as f:
-            json.dump([], f)
+# ---------- helpers ----------
+def load(path):
+    with open(path) as fp: return json.load(fp)
 
-def load_json(file):
-    with open(file, 'r') as f:
-        return json.load(f)
+def save(path, data):
+    with open(path, "w") as fp: json.dump(data, fp, indent=2)
 
-def save_json(file, data):
-    with open(file, 'w') as f:
-        json.dump(data, f, indent=2)
+def user_obj(name):
+    users = load(DATA["USERS"])
+    return next((u for u in users if u["nom"] == name), None)
 
-# 🔄 Publier une publicité (envoyée à tous les clients connectés)
+# ---------- publicités temps‑réel ----------
 @app.route("/send_pub", methods=["POST"])
 def send_pub():
-    data = request.json
-    message = data.get("message", "")
-    socketio.emit("pub", message)  # Événement envoyé aux clients
-    return jsonify({"status": "pub envoyée"}), 200
+    msg = request.json.get("message", "")
+    socketio.emit("pub", msg, broadcast=True)
+    return {"ok": True}
 
-# ✅ Ajouter un match
+# ---------- inscription utilisateur ----------
+@app.route("/register", methods=["POST"])
+def register():
+    nom = request.json.get("nom")
+    age = int(request.json.get("age", 0))
+    if age < 18:
+        return {"error": "Interdit aux moins de 18 ans"}, 403
+
+    users = load(DATA["USERS"])
+    if user_obj(nom):
+        return {"message": "Déjà inscrit"}, 200
+
+    users.append({"nom": nom, "age": age, "fc": 0, "usd": 0})
+    save(DATA["USERS"], users)
+    return {"message": f"Bienvenue {nom}"}, 201
+
+# ---------- dépôt d’argent ----------
+@app.route("/deposit", methods=["POST"])
+def deposit():
+    nom   = request.json.get("nom")
+    fc    = int(request.json.get("fc", 0))
+    usd   = int(request.json.get("usd", 0))
+
+    user = user_obj(nom)
+    if not user:
+        return {"error": "Utilisateur inconnu"}, 404
+
+    user["fc"]  += fc
+    user["usd"] += usd
+    users = load(DATA["USERS"])
+    for u in users:
+        if u["nom"] == nom:
+            u.update(user)
+            break
+    save(DATA["USERS"], users)
+    return {"message": "Dépôt enregistré", "solde": user}, 200
+
+# ---------- consulter solde ----------
+@app.route("/balance/<nom>")
+def balance(nom):
+    user = user_obj(nom)
+    if not user:
+        return {"error": "Utilisateur inconnu"}, 404
+    return {"fc": user["fc"], "usd": user["usd"]}
+
+# ---------- matchs / paris / résultats (inchangés) ----------
 @app.route("/add_match", methods=["POST"])
 def add_match():
-    data = request.json
-    equipe1 = data.get("equipe1")
-    equipe2 = data.get("equipe2")
-    match_id = f"match_{len(load_json(MATCHS_FILE)) + 1}"
-    new_match = {"id": match_id, "equipe1": equipe1, "equipe2": equipe2}
-    matchs = load_json(MATCHS_FILE)
-    matchs.append(new_match)
-    save_json(MATCHS_FILE, matchs)
-    return jsonify({"message": "Match ajouté", "match": new_match}), 201
+    d = request.json
+    m_id = f"match_{len(load(DATA['MATCHS']))+1}"
+    newm = {"id": m_id, "equipe1": d["equipe1"], "equipe2": d["equipe2"]}
+    m = load(DATA["MATCHS"]); m.append(newm); save(DATA["MATCHS"], m)
+    socketio.emit("pub", "Nouveau match disponible !", broadcast=True)  # optionnel
+    return {"match": newm}, 201
 
-# 📋 Voir tous les matchs
-@app.route("/get_matchs", methods=["GET"])
-def get_matchs():
-    return jsonify(load_json(MATCHS_FILE))
+@app.route("/get_matchs")
+def get_matchs(): return jsonify(load(DATA["MATCHS"]))
 
-# 🗳 Parier sur un match
 @app.route("/parier", methods=["POST"])
 def parier():
-    data = request.json
-    user = data.get("user")
-    match_id = data.get("match_id")
-    choix = data.get("choix")
+    d = request.json
+    user, match_id, choix = d["user"], d["match_id"], d["choix"]
+    p = load(DATA["PARIS"])
+    if any(x for x in p if x["user"]==user and x["match_id"]==match_id):
+        return {"error":"Déjà parié"},400
+    p.append({"user":user,"match_id":match_id,"choix":choix})
+    save(DATA["PARIS"], p); return {"ok":True}
 
-    paris = load_json(PARIS_FILE)
-    for p in paris:
-        if p["user"] == user and p["match_id"] == match_id:
-            return jsonify({"error": "Vous avez déjà parié sur ce match"}), 400
-
-    paris.append({"user": user, "match_id": match_id, "choix": choix})
-    save_json(PARIS_FILE, paris)
-    return jsonify({"message": "Pari enregistré"}), 200
-
-# ✅ Ajouter un résultat
 @app.route("/add_resultat", methods=["POST"])
-def add_resultat():
-    data = request.json
-    match_id = data.get("match_id")
-    gagnant = data.get("gagnant")
+def add_result():
+    d = request.json
+    r = load(DATA["RESULTS"]); r.append(d); save(DATA["RESULTS"], r)
+    socketio.emit("pub", f"Résultat publié pour {d['match_id']}", broadcast=True)
+    return {"ok":True}
 
-    resultats = load_json(RESULTATS_FILE)
-    resultats.append({"match_id": match_id, "gagnant": gagnant})
-    save_json(RESULTATS_FILE, resultats)
-    return jsonify({"message": "Résultat ajouté"}), 200
+@app.route("/get_resultat/<user>")
+def get_res(user):
+    p,res,mat = load(DATA["PARIS"]), load(DATA["RESULTS"]), load(DATA["MATCHS"])
+    out=[]
+    for x in p:
+        if x["user"]==user:
+            m=next((k for k in mat if k["id"]==x["match_id"]),None)
+            r=next((y for y in res if y["match_id"]==x["match_id"]),None)
+            if m and r:
+                out.append({"match":f"{m['equipe1']} vs {m['equipe2']}",
+                            "choix":x["choix"],"gagnant":r["gagnant"],
+                            "résultat":"gagné" if x["choix"]==r["gagnant"] else "perdu"})
+    return jsonify(out)
 
-# 📊 Voir les résultats d’un utilisateur
-@app.route("/get_resultat/<user>", methods=["GET"])
-def get_resultat(user):
-    paris = load_json(PARIS_FILE)
-    resultats = load_json(RESULTATS_FILE)
-    matchs = load_json(MATCHS_FILE)
-
-    retour = []
-    for p in paris:
-        if p["user"] == user:
-            match = next((m for m in matchs if m["id"] == p["match_id"]), None)
-            resultat = next((r for r in resultats if r["match_id"] == p["match_id"]), None)
-            if match and resultat:
-                etat = "gagné" if p["choix"] == resultat["gagnant"] else "perdu"
-                retour.append({
-                    "match": f'{match["equipe1"]} vs {match["equipe2"]}',
-                    "choix": p["choix"],
-                    "gagnant": resultat["gagnant"],
-                    "résultat": etat
-                })
-
-    return jsonify(retour), 200
-
-# 🚀 Lancer le serveur
+# ---------- lancement ----------
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
+    import eventlet; eventlet.monkey_patch()
+    port = int(os.environ.get("PORT",5000))
     socketio.run(app, host="0.0.0.0", port=port)
+
